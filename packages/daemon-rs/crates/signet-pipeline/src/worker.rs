@@ -272,17 +272,22 @@ async fn worker_loop(
     }
 
     // Startup recovery: mark memory_jobs stuck in 'pending' with exhausted
-    // attempts as 'dead'. The tick loop requires attempts < max_attempts, so
-    // these jobs are silently skipped forever without this step, causing the
-    // stall detector to fire on every interval.
-    // Parity: mirrors recoverMemoryJobs() added to JS worker.ts in PR #372.
+    // attempts as 'dead'. The tick loop uses `attempts < config.max_retries`
+    // (runtime value) to decide leasability; jobs are silently skipped forever
+    // without this step, causing the stall detector to fire indefinitely.
+    //
+    // Parity with JS worker.ts recoverMemoryJobs() (PR #372 / PR #409):
+    // Use MIN(max_attempts, ?1) so a lowered runtime maxRetries also recovers
+    // jobs that are no longer leasable but have not yet hit the DB column limit.
+    let effective_max_retries = i64::from(config.max_retries);
     {
         let recover = pool
-            .write(signet_core::db::Priority::Low, |conn| {
+            .write(signet_core::db::Priority::Low, move |conn| {
                 let updated = conn.execute(
                     "UPDATE memory_jobs SET status = 'dead'
-                     WHERE status = 'pending' AND attempts >= max_attempts",
-                    [],
+                     WHERE status = 'pending'
+                       AND attempts >= MIN(max_attempts, ?1)",
+                    rusqlite::params![effective_max_retries],
                 )?;
                 Ok(updated.into())
             })
@@ -547,6 +552,8 @@ async fn fail_job(pool: &DbPool, job_id: &str, error: &str) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::{WorkerRuntimeStats, new_runtime_stats_handle};
+    use signet_core::db::{DbPool, Priority};
+    use signet_core::error::CoreError;
 
     #[test]
     fn runtime_stats_preserve_overload_since_and_countdown() {
@@ -595,5 +602,121 @@ mod tests {
         assert_eq!(snap.overload_backoff_ms, 42_000);
         assert!(!snap.running);
         assert!(!snap.overloaded);
+    }
+
+    fn test_db_path(label: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|v| v.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("signet-worker-{label}-{pid}-{ts}.db"))
+    }
+
+    /// Startup recovery must mark exhausted jobs as dead using MIN(max_attempts, runtime_max_retries).
+    /// When runtime maxRetries is lowered below the stored DB max_attempts, jobs that are no longer
+    /// leasable (attempts >= runtime limit) must not remain stuck in 'pending' forever.
+    #[tokio::test]
+    async fn startup_recovery_respects_runtime_max_retries_when_lower_than_db_column() {
+        let path = test_db_path("recovery-runtime-retries");
+        let (pool, _handle) = DbPool::open(&path).expect("failed to open DB");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Insert a job: attempts=3, max_attempts=5 (DB column allows 5 total)
+        // Runtime maxRetries is 3, so this job is no longer leasable but not "dead" per DB column.
+        pool.write(Priority::Low, {
+            let now = now.clone();
+            move |conn| {
+                conn.execute(
+                    "INSERT INTO memory_jobs
+                     (id, job_type, status, attempts, max_attempts, created_at, updated_at)
+                     VALUES (?1, 'extract', 'pending', 3, 5, ?2, ?2)",
+                    rusqlite::params!["job-lowered-retries", now],
+                )?;
+                Ok(serde_json::Value::Null)
+            }
+        })
+        .await
+        .expect("insert failed");
+
+        // Run recovery with runtime max_retries=3 — job should become 'dead'.
+        let effective_max_retries: i64 = 3;
+        pool.write(Priority::Low, move |conn| {
+            let updated = conn.execute(
+                "UPDATE memory_jobs SET status = 'dead'
+                 WHERE status = 'pending'
+                   AND attempts >= MIN(max_attempts, ?1)",
+                rusqlite::params![effective_max_retries],
+            )?;
+            Ok(serde_json::json!(updated))
+        })
+        .await
+        .expect("recovery write failed");
+
+        // Verify: job is now 'dead'.
+        let status: String = pool
+            .read(move |conn| -> Result<String, CoreError> {
+                conn.query_row(
+                    "SELECT status FROM memory_jobs WHERE id = ?1",
+                    rusqlite::params!["job-lowered-retries"],
+                    |row| row.get(0),
+                )
+                .map_err(CoreError::Db)
+            })
+            .await
+            .expect("read failed");
+
+        assert_eq!(status, "dead", "job should be marked dead when attempts >= runtime maxRetries");
+    }
+
+    /// A job with attempts < runtime maxRetries must NOT be marked dead by startup recovery.
+    #[tokio::test]
+    async fn startup_recovery_does_not_mark_leasable_jobs_dead() {
+        let path = test_db_path("recovery-leasable");
+        let (pool, _handle) = DbPool::open(&path).expect("failed to open DB");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Insert a leasable job: attempts=1, max_attempts=3, runtime maxRetries=3
+        pool.write(Priority::Low, {
+            let now = now.clone();
+            move |conn| {
+                conn.execute(
+                    "INSERT INTO memory_jobs
+                     (id, job_type, status, attempts, max_attempts, created_at, updated_at)
+                     VALUES (?1, 'extract', 'pending', 1, 3, ?2, ?2)",
+                    rusqlite::params!["job-leasable", now],
+                )?;
+                Ok(serde_json::Value::Null)
+            }
+        })
+        .await
+        .expect("insert failed");
+
+        let effective_max_retries: i64 = 3;
+        pool.write(Priority::Low, move |conn| {
+            let updated = conn.execute(
+                "UPDATE memory_jobs SET status = 'dead'
+                 WHERE status = 'pending'
+                   AND attempts >= MIN(max_attempts, ?1)",
+                rusqlite::params![effective_max_retries],
+            )?;
+            Ok(serde_json::json!(updated))
+        })
+        .await
+        .expect("recovery write failed");
+
+        let status: String = pool
+            .read(move |conn| -> Result<String, CoreError> {
+                conn.query_row(
+                    "SELECT status FROM memory_jobs WHERE id = ?1",
+                    rusqlite::params!["job-leasable"],
+                    |row| row.get(0),
+                )
+                .map_err(CoreError::Db)
+            })
+            .await
+            .expect("read failed");
+
+        assert_eq!(status, "pending", "leasable job must not be marked dead by startup recovery");
     }
 }
